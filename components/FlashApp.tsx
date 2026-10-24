@@ -4,33 +4,28 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Health } from '@/app/api/health/route'
 import type { LockView, PlateView } from '@/lib/ecurious'
 import type { BBox, Station } from '@/lib/goingelectric'
-import { type Bay, ensureGuest, getSupabase, rpcErrorText } from '@/lib/supabase-browser'
+import { TUM_STAMMGELAENDE } from '@/lib/fleet-sites'
+import { activeCar, DEMO_PROFILE, type Garage, loadGarage, loadPlan, loadTrust, type Plan } from '@/lib/profile'
+import { activeReservations, type StationReservation } from '@/lib/station-reservations'
+import BayNotice, { loadSeenBayNotices, noticeKey, pendingBayNotice } from './BayNotice'
+import ProfileView from './ProfileView'
 
 const MapView = dynamic(() => import('./MapView'), {
   ssr: false,
   loading: () => <div className="grid h-full place-items-center text-sm text-gray-500">Karte lädt …</div>,
 })
 
-const BERLIN: [number, number] = [52.52, 13.405]
 const SSE_EVENTS = ['status_change', 'vehicle_presence', 'photo_captured', 'alarm'] as const
-
-// crypto.randomUUID gibt es nur in sicheren Kontexten (https/localhost), nicht über die LAN-IP am Handy.
-const uuid = () =>
-  crypto.randomUUID?.() ??
-  '10000000-1000-4000-8000-100000000000'.replace(/[018]/g, (c) =>
-    (Number(c) ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (Number(c) / 4)))).toString(16),
-  )
+// Seitenleiste (Parkbügel-Status, manuelle Steuerung) vorerst ausgeblendet – nur die Karte.
+// Solange sie aus ist, fragt die Seite auch keinen Bügel-Status ab. Der Whitelist-Abgleich der
+// Reservierungen läuft davon unabhängig auf dem Server.
+const SHOW_STATUS_PANEL = false
 
 const ago = (sec: number | null) =>
   sec == null ? 'unbekannt' : sec < 120 ? `vor ${Math.round(sec)} s` : `vor ${Math.round(sec / 60)} min`
 
-const mmss = (ms: number) => {
-  const s = Math.max(0, Math.ceil(ms / 1000))
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
-}
-
 function StatusBar({ health }: { health: Health | null }) {
-  const groups = ['GoingElectric', 'Supabase', 'Ecurious'] as const
+  const groups = ['GoingElectric', 'Ecurious'] as const
   return (
     <details className="text-xs">
       <summary className="flex cursor-pointer list-none flex-wrap gap-2">
@@ -60,31 +55,33 @@ function StatusBar({ health }: { health: Health | null }) {
 
 export default function FlashApp() {
   const [now, setNow] = useState(0) // erst im Browser setzen, nicht beim Prerender
+  const [tab, setTab] = useState<'map' | 'profile'>('map')
   const [health, setHealth] = useState<Health | null>(null)
-
-  // Supabase
-  const [bays, setBays] = useState<Bay[]>([])
-  const [offsetMs, setOffsetMs] = useState(0) // DB-Uhr minus Browser-Uhr
-  const [sbState, setSbState] = useState('verbinde …')
-  const [realtime, setRealtime] = useState('–')
-  const [busy, setBusy] = useState(false)
-  const [msg, setMsg] = useState<string | null>(null)
 
   // Ecurious
   const [defaultLockId, setDefaultLockId] = useState<string | null>(null)
+  const [locks, setLocks] = useState<LockView[]>([])
+  const [pickedLockId, setPickedLockId] = useState<string | null>(null)
   const [lock, setLock] = useState<(LockView & { fetchedAt: number }) | null>(null)
   const [plate, setPlate] = useState<PlateView | null>(null)
   const [lockError, setLockError] = useState<string | null>(null)
   const [sse, setSse] = useState<'connecting' | 'open' | 'down'>('connecting')
   const [lastEvent, setLastEvent] = useState<string | null>(null)
+  const [adminMsg, setAdminMsg] = useState<string | null>(null)
+  const [cancelAutoLift, setCancelAutoLift] = useState(false)
+  const [platesInput, setPlatesInput] = useState('')
 
   // GoingElectric
   const [stations, setStations] = useState<Station[]>([])
   const [stationsMsg, setStationsMsg] = useState<string | null>(null)
   const [searching, setSearching] = useState(false)
+  const [stationRes, setStationRes] = useState<StationReservation[]>([])
+  const [focusRes, setFocusRes] = useState<StationReservation | null>(null) // aus dem Profil "Auf Karte zeigen"
+  const [bayNotice, setBayNotice] = useState<StationReservation | null>(null)
+  const [seenBayNotices, setSeenBayNotices] = useState<string[]>([])
+  const [profileLoaded, setProfileLoaded] = useState(false)
 
-  const bay = bays[0] ?? null
-  const lockId = bay?.lock_id ?? defaultLockId
+  const lockId = pickedLockId ?? defaultLockId
   const lockIdRef = useRef(lockId)
   lockIdRef.current = lockId
 
@@ -102,83 +99,15 @@ export default function FlashApp() {
     return () => clearInterval(t)
   }, [])
 
-  // ---------- Supabase: Gast-Login, list_bays, Realtime ----------
-  const loadBays = useCallback(async () => {
-    const sb = getSupabase()
-    if (!sb) return
-    const { data, error } = await sb.rpc('list_bays')
-    if (error) {
-      setSbState(`list_bays fehlgeschlagen: ${error.message}`)
-      return
-    }
-    const rows = (data ?? []) as Bay[]
-    setBays(rows)
-    if (rows[0]) setOffsetMs(Date.parse(rows[0].server_now) - Date.now())
-    setSbState('verbunden')
-  }, [])
-
-  useEffect(() => {
-    const sb = getSupabase()
-    if (!sb) {
-      setSbState('nicht konfiguriert (NEXT_PUBLIC_SUPABASE_* fehlt)')
-      return
-    }
-    let channel: ReturnType<typeof sb.channel> | null = null
-    let cancelled = false
-    ;(async () => {
-      try {
-        await ensureGuest(sb)
-        await sb.realtime.setAuth()
-        if (cancelled) return
-        await loadBays()
-        channel = sb
-          .channel('bays', { config: { private: true } })
-          .on('broadcast', { event: 'reservation_changed' }, () => loadBays())
-          .subscribe((status) => setRealtime(status === 'SUBSCRIBED' ? 'live' : status.toLowerCase()))
-      } catch (err) {
-        setSbState(`Gast-Login fehlgeschlagen: ${(err as Error).message}`)
-      }
-    })()
-    return () => {
-      cancelled = true
-      if (channel) sb.removeChannel(channel)
-    }
-  }, [loadBays])
-
-  // Hold abgelaufen → einmal neu laden (Status kommt immer aus der DB).
-  const remainingMs = bay?.expires_at ? Date.parse(bay.expires_at) - (now + offsetMs) : null
-  const expiredRef = useRef<string | null>(null)
-  useEffect(() => {
-    if (bay?.expires_at && remainingMs !== null && remainingMs <= 0 && expiredRef.current !== bay.expires_at) {
-      expiredRef.current = bay.expires_at
-      loadBays()
-    }
-  }, [bay?.expires_at, remainingMs, loadBays])
-
-  const callRpc = async (fn: string, args: Record<string, unknown>) => {
-    const sb = getSupabase()
-    if (!sb) return
-    setBusy(true)
-    setMsg(null)
-    try {
-      let r = await sb.rpc(fn, args)
-      if (r.error && !r.error.code) r = await sb.rpc(fn, args) // Netzwerkfehler: einmal wiederholen (idempotent)
-      if (r.error) setMsg(rpcErrorText(r.error.message))
-      await loadBays()
-    } finally {
-      setBusy(false)
-    }
-  }
-  const reserve = () => bay && callRpc('reserve_bay', { bay_id: bay.id, minutes: 10, request_id: uuid() })
-  const cancel = () => bay?.reservation_id && callRpc('cancel_reservation', { id: bay.reservation_id })
-
   // ---------- Ecurious: Lock-Status (SSE + Polling-Fallback) ----------
   useEffect(() => {
+    if (!SHOW_STATUS_PANEL) return
     fetch('/api/locks')
       .then(async (r) => {
         const body = await r.json()
         if (!r.ok) throw new Error(body.error)
         setDefaultLockId(body.defaultLockId)
+        setLocks(body.locks)
         if (!body.defaultLockId) setLockError('Keine Locks für diesen API-Key')
       })
       .catch((err) => setLockError(err.message))
@@ -200,7 +129,7 @@ export default function FlashApp() {
   }, [])
 
   useEffect(() => {
-    if (!lockId) return
+    if (!SHOW_STATUS_PANEL || !lockId) return
     refreshLock()
     const t = setInterval(refreshLock, sse === 'open' ? 30_000 : 5_000)
     return () => clearInterval(t)
@@ -208,6 +137,7 @@ export default function FlashApp() {
 
   const [sseAttempt, setSseAttempt] = useState(0)
   useEffect(() => {
+    if (!SHOW_STATUS_PANEL) return
     const es = new EventSource('/api/locks/events')
     let retry: ReturnType<typeof setTimeout> | undefined
     es.onopen = () => setSse('open')
@@ -223,7 +153,8 @@ export default function FlashApp() {
       es.addEventListener(type, (e) => {
         const d = JSON.parse((e as MessageEvent).data)
         if (lockIdRef.current && d.lockId !== lockIdRef.current) return
-        setLastEvent(`${type} · ${new Date(d.timestamp ?? Date.now()).toLocaleTimeString('de-DE')}`)
+        const detail = type === 'alarm' ? ` (${d.error ?? 'unbekannt'})` : ''
+        setLastEvent(`${type}${detail} · ${new Date(d.timestamp ?? Date.now()).toLocaleTimeString('de-DE')}`)
         refreshLock()
       })
     }
@@ -238,26 +169,49 @@ export default function FlashApp() {
   const lockStale = !lock || lock.stale || lockAge === null || lockAge > 60
 
   // ---------- Admin-Befehle (nur bei ECURIOUS_COMMANDS_ENABLED) ----------
-  const command = async (action: 'lock' | 'unlock') => {
+  // cmd entspricht dem Body von POST /api/locks/[id]/command: lock, unlock, keep-state, whitelist.
+  // Ohne question geht der Befehl sofort raus (Öffnen/Schließen).
+  const command = async (cmd: Record<string, unknown>, question?: string) => {
     if (!lockId) return
-    const label = action === 'lock' ? 'HOCHFAHREN (Platz sperren)' : 'SENKEN (Platz freigeben)'
-    if (!confirm(`Bügel wirklich ${label}? Das bewegt echte Hardware.`)) return
-    let token = sessionStorage.getItem('flash-admin-token')
-    if (!token) {
-      token = prompt('Admin-Token (FLASH_ADMIN_TOKEN):')
+    if (question && !confirm(`${question} (${lockId})`)) return
+    setAdminMsg(null)
+    // Lokal ohne FLASH_ADMIN_TOKEN geht es direkt; nur wenn der Server 401 meldet, nach dem Token fragen.
+    const send = (token: string | null) =>
+      fetch(`/api/locks/${encodeURIComponent(lockId)}/command`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { 'x-admin-token': token } : {}) },
+        body: JSON.stringify(cmd),
+      })
+    let r = await send(sessionStorage.getItem('flash-admin-token'))
+    if (r.status === 401) {
+      sessionStorage.removeItem('flash-admin-token')
+      const token = prompt('Admin-Token (FLASH_ADMIN_TOKEN):')
       if (!token) return
+      r = await send(token)
+      if (r.ok) sessionStorage.setItem('flash-admin-token', token)
     }
-    setMsg(null)
-    const r = await fetch(`/api/locks/${encodeURIComponent(lockId)}/command`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-admin-token': token },
-      body: JSON.stringify({ action }),
-    })
     const body = await r.json().catch(() => ({}))
-    if (r.status === 401) sessionStorage.removeItem('flash-admin-token')
-    else sessionStorage.setItem('flash-admin-token', token)
-    setMsg(r.ok ? `Befehl bestätigt: ${body.message ?? 'ok'} – echter Zustand folgt per Live-Status.` : body.error ?? `HTTP ${r.status}`)
+    const whitelist = Array.isArray(body.whitelist) ? ` Whitelist: ${body.whitelist.join(', ') || 'leer'}` : ''
+    setAdminMsg(
+      r.ok
+        ? `Befehl bestätigt: ${body.message ?? (body.state ? `Modus ${body.state}` : 'ok')}.${whitelist} Echter Zustand folgt per Live-Status.`
+        : `Fehler: ${body.error ?? `HTTP ${r.status}`}`,
+    )
     setTimeout(refreshLock, 1500)
+  }
+
+  const moveBarrier = (action: 'lock' | 'unlock') => command({ action, cancelAutoLift })
+  const keepState = (state: 'normal' | 'keep_open' | 'keep_closed') =>
+    command({ action: 'keep-state', state }, `Schrankenmodus auf „${state}“ setzen?`)
+  const setWhitelist = (mode: 'plates' | 'wildcard' | 'off') => {
+    if (mode === 'wildcard') return command({ action: 'whitelist', wildcard: true }, 'Auto-Unlock für JEDES Fahrzeug einschalten?')
+    if (mode === 'off') return command({ action: 'whitelist', plates: [] }, 'Auto-Unlock ausschalten (Whitelist leeren)?')
+    const plates = platesInput.split(/[,;\n]/).map((p) => p.trim().toUpperCase()).filter(Boolean)
+    if (!plates.length || plates.length > 10 || plates.some((p) => p.length > 15)) {
+      setAdminMsg('Fehler: 1–10 Kennzeichen, je höchstens 15 Zeichen, mit Komma getrennt.')
+      return
+    }
+    return command({ action: 'whitelist', plates }, `Auto-Unlock nur für ${plates.join(', ')} erlauben?`)
   }
 
   // ---------- GoingElectric ----------
@@ -278,68 +232,240 @@ export default function FlashApp() {
     }
   }, [])
 
+  // ---------- Ladesäulen-Reservierungen (Server, gleiche Daten wie die externe API) ----------
+  const [garage, setGarage] = useState<Garage>({ cars: [], activeId: null })
+  const [plan, setPlan] = useState<Plan>('free')
+  const [trust, setTrust] = useState(DEMO_PROFILE.trustFactor)
+  const [resError, setResError] = useState<string | null>(null)
+  const loadStationRes = useCallback(async () => {
+    try {
+      const r = await fetch('/api/reservations')
+      const body = await r.json()
+      if (!r.ok) throw new Error(body.error ?? `HTTP ${r.status}`)
+      setStationRes(body.reservations)
+      setResError(null)
+    } catch (err) {
+      setResError(`Reservierungen nicht geladen: ${(err as Error).message}`)
+    }
+  }, [])
+  // Termin hat seinen Bay bekommen (30 min vorher) → einmal als Popup melden.
+  useEffect(() => {
+    if (!bayNotice && profileLoaded) setBayNotice(pendingBayNotice(stationRes, seenBayNotices))
+  }, [stationRes, bayNotice, profileLoaded, seenBayNotices])
+  const closeBayNotice = (show: boolean) => {
+    if (!bayNotice) return
+    const seen = [...seenBayNotices, noticeKey(bayNotice)].slice(-50)
+    setSeenBayNotices(seen)
+    void saveProfile({ seenBayNotices: seen })
+    if (show) {
+      setFocusRes(bayNotice)
+      setTab('map')
+    }
+    setBayNotice(null)
+  }
+
+  // Alle 5 s neu laden, damit Buchungen von anderen Servern (API) hier auftauchen.
+  useEffect(() => {
+    loadStationRes()
+    const t = setInterval(loadStationRes, 5_000)
+    return () => clearInterval(t)
+  }, [loadStationRes])
+  // Demo-Profil liegt auf dem Server (.data/demo-profile.json) und gilt für jeden Browser.
+  // Gibt es die Datei noch nicht, werden einmal die bisherigen Browser-Daten hochgeladen.
+  const saveProfile = (patch: Record<string, unknown>) =>
+    fetch('/api/profile', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) }).catch(() => {})
+  useEffect(() => {
+    ;(async () => {
+      try {
+        const body = await (await fetch('/api/profile')).json()
+        let p = body.profile
+        const localGarage = loadGarage()
+        // Erster Start: alles übernehmen. Hat der Server noch keine Autos, dieser Browser aber schon: Autos nachreichen.
+        if (!body.exists) {
+          p = { garage: localGarage, plan: loadPlan(), trustFactor: loadTrust(), seenBayNotices: loadSeenBayNotices() }
+          await saveProfile(p)
+        } else if (!p.garage.cars.length && localGarage.cars.length) {
+          p = { ...p, garage: localGarage }
+          await saveProfile({ garage: localGarage })
+        }
+        setGarage(p.garage)
+        setPlan(p.plan)
+        setTrust(p.trustFactor)
+        setSeenBayNotices(p.seenBayNotices ?? [])
+      } finally {
+        setProfileLoaded(true)
+      }
+    })()
+  }, [])
+  const updateTrust = (value: number) => {
+    setTrust(value)
+    void saveProfile({ trustFactor: value })
+  }
+  const updatePlan = (p: Plan) => {
+    setPlan(p)
+    void saveProfile({ plan: p })
+  }
+  const updateGarage = (g: Garage) => {
+    setGarage(g)
+    void saveProfile({ garage: g })
+  }
+  // Die Popup-Reservierung ist vorab im Browser geprüft; Gebühr und Bay legt der Server fest.
+  const reserveStation = async (r: StationReservation) => {
+    const car = activeCar(garage)
+    try {
+      const res = await fetch('/api/reservations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          stationId: r.stationId,
+          stationName: r.stationName,
+          stationAddress: r.stationAddress,
+          lat: r.lat,
+          lng: r.lng,
+          chargePoints: r.chargePoints,
+          kind: r.kind,
+          startsAt: r.kind === 'scheduled' ? r.startsAt : undefined,
+          plan,
+          car: car && { name: car.name, plate: car.plate },
+        }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) return body.error ?? `Fehler (HTTP ${res.status})`
+      await loadStationRes()
+      return null
+    } catch {
+      return 'Keine Verbindung zum Server.'
+    }
+  }
+  const cancelWithRefund = async (stationId: number): Promise<{ refundEur: number | null } | { error: string }> => {
+    try {
+      const res = await fetch(`/api/reservations/${stationId}`, { method: 'DELETE' })
+      const body = await res.json().catch(() => ({}))
+      await loadStationRes()
+      return res.ok ? { refundEur: body.refundEur ?? null } : { error: body.error ?? `Fehler (HTTP ${res.status})` }
+    } catch {
+      return { error: 'Keine Verbindung zum Server.' }
+    }
+  }
+  const cancelStation = async (stationId: number) => {
+    await fetch(`/api/reservations/${stationId}`, { method: 'DELETE' }).catch(() => {})
+    await loadStationRes()
+  }
+  const myStationRes = now ? activeReservations(stationRes, now) : stationRes
+
   // ---------- Anzeige ----------
-  const bayLabel = !bay
-    ? ''
-    : bay.status === 'free'
-      ? 'Frei'
-      : bay.held_by_me
-        ? `Von dir reserviert – noch ${mmss(remainingMs ?? 0)}`
-        : `Reserviert (anderer Gast) – frei in ${mmss(remainingMs ?? 0)}`
-  const barrier = lockStale ? 'unbekannt' : lock?.status === 'raised' ? 'oben (gesperrt)' : 'unten (offen)'
+  const barrier = lockStale
+    ? 'unbekannt'
+    : { raised: 'oben (gesperrt)', lowered: 'unten (offen)', moving: 'fährt gerade …', unknown: 'unbekannt' }[lock?.status ?? 'unknown']
   const presence = lockStale ? 'unbekannt' : lock?.carPresence === 'occupied' ? 'belegt' : 'frei'
 
   return (
-    <div className="flex min-h-dvh flex-col md:h-dvh">
+    <div className="flex h-dvh flex-col">
+      {bayNotice && (
+        <BayNotice
+          reservation={bayNotice}
+          onClose={() => closeBayNotice(false)}
+          onShow={() => closeBayNotice(true)}
+          onCancel={() => cancelWithRefund(bayNotice.stationId)}
+        />
+      )}
       <header className="flex flex-wrap items-start justify-between gap-2 border-b border-gray-200 px-4 py-2">
-        <h1 className="text-lg font-bold tracking-tight">⚡ FLASH</h1>
+        <div className="flex items-center gap-4">
+          <h1 className="text-lg font-bold tracking-tight">⚡ FLASH</h1>
+          <nav className="flex gap-1 text-sm">
+            {(
+              [
+                ['map', 'Karte'],
+                ['profile', 'Profil'],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                onClick={() => setTab(id)}
+                aria-current={tab === id ? 'page' : undefined}
+                className={`rounded-md px-3 py-1 font-medium ${tab === id ? 'bg-gray-900 text-white' : 'text-gray-700 hover:bg-gray-100'}`}
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
+        </div>
         <StatusBar health={health} />
       </header>
 
-      <main className="flex flex-1 flex-col md:min-h-0 md:flex-row">
-        <section className="h-[55vh] md:h-auto md:flex-1">
+      {/* Karte bleibt gemountet (Leaflet, SSE); das Profil liegt darüber. */}
+      <div className="relative flex flex-1 flex-col md:min-h-0">
+      {tab === 'profile' && (
+        <div className="absolute inset-0 z-[1100] overflow-y-auto bg-white">
+          <ProfileView
+            reservations={myStationRes}
+            onCancel={cancelStation}
+            onShow={(r) => {
+              setFocusRes(r)
+              setTab('map')
+            }}
+            garage={garage}
+            onGarageChange={updateGarage}
+            plan={plan}
+            onPlanChange={updatePlan}
+            trustFactor={trust}
+            onTrustChange={updateTrust}
+          />
+        </div>
+      )}
+      <main className="flex min-h-0 flex-1 flex-col md:flex-row">
+        <section className={`relative ${SHOW_STATUS_PANEL ? 'h-[55vh] md:h-auto md:flex-1' : 'min-h-0 flex-1'}`}>
           <MapView
-            center={bay ? [bay.lat, bay.lng] : BERLIN}
+            center={TUM_STAMMGELAENDE}
             stations={stations}
-            bays={bays}
-            bayLabel={bayLabel}
             searching={searching}
             onSearch={searchStations}
+            reservations={myStationRes}
+            onReserve={reserveStation}
+            onCancel={cancelStation}
+            car={activeCar(garage)}
+            plan={plan}
+            trust={trust}
+            focus={focusRes}
+            onFocusDone={() => setFocusRes(null)}
+            onOpenProfile={() => setTab('profile')}
           />
+          {/* Nur Fehler einblenden (Ladesäulen oder Reservierungen nicht geladen). */}
+          {(resError || stationsMsg?.startsWith('Ladesäulen:')) && (
+            <p className="absolute right-3 top-16 z-[1000] max-w-xs rounded-lg bg-red-50 px-3 py-2 text-xs text-red-800 shadow ring-1 ring-red-200">
+              {resError ?? stationsMsg}
+            </p>
+          )}
         </section>
 
+        {SHOW_STATUS_PANEL && (
         <aside className="w-full space-y-4 p-4 text-sm md:w-96 md:overflow-y-auto">
-          <div className="rounded-lg border border-gray-200 p-3">
-            <h2 className="font-semibold">{bay?.name ?? 'Stellplatz'}</h2>
-            <p className="text-xs text-gray-500">Supabase: {sbState} · Realtime: {realtime}</p>
-            {bay && (
-              <>
-                <p className={`mt-2 text-base font-semibold ${bay.status === 'free' ? 'text-green-700' : 'text-amber-700'}`}>{bayLabel}</p>
-                <div className="mt-3 flex gap-2">
-                  <button
-                    onClick={reserve}
-                    disabled={busy || bay.status !== 'free'}
-                    className="flex-1 rounded-md bg-blue-600 px-3 py-2 font-semibold text-white disabled:opacity-40"
-                  >
-                    Reservieren 10 min
-                  </button>
-                  <button
-                    onClick={cancel}
-                    disabled={busy || !bay.held_by_me}
-                    className="flex-1 rounded-md border border-gray-300 px-3 py-2 font-semibold disabled:opacity-40"
-                  >
-                    Stornieren
-                  </button>
-                </div>
-              </>
-            )}
-            {msg && <p className="mt-2 text-xs text-red-700">{msg}</p>}
-          </div>
-
           <div className="rounded-lg border border-gray-200 p-3">
             <h2 className="font-semibold">
               Parkbügel {lock?.name ? `· ${lock.name}` : ''} {health?.ecuriousMock && <span className="text-amber-700">(Mock)</span>}
             </h2>
+            {locks.length > 1 && (
+              <label className="mt-1 flex items-center gap-2 text-xs text-gray-600">
+                Lock
+                <select
+                  value={lockId ?? ''}
+                  onChange={(e) => {
+                    setPickedLockId(e.target.value)
+                    setLock(null)
+                    setPlate(null)
+                    setLastEvent(null)
+                    setAdminMsg(null)
+                  }}
+                  className="rounded border border-gray-300 bg-white px-1 py-0.5"
+                >
+                  {locks.map((l) => (
+                    <option key={l.id} value={l.id}>
+                      {l.name} ({l.id})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             {lockError && <p className="text-xs text-red-700">{lockError}</p>}
             <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
               <dt className="text-gray-500">Bügel</dt>
@@ -364,23 +490,62 @@ export default function FlashApp() {
                 <p className="mb-2 text-xs font-semibold uppercase text-red-700">Admin · bewegt echte Hardware</p>
                 <div className="flex gap-2">
                   <button
-                    onClick={() => command('lock')}
+                    onClick={() => moveBarrier('lock')}
                     disabled={lockStale || lock?.carPresence !== 'vacant'}
                     title={lockStale || lock?.carPresence !== 'vacant' ? 'Nur bei frisch gemeldetem freien Platz' : undefined}
                     className="flex-1 rounded-md bg-red-600 px-3 py-2 font-semibold text-white disabled:opacity-40"
                   >
-                    Bügel hoch
+                    Schließen (Bügel hoch)
                   </button>
-                  <button onClick={() => command('unlock')} className="flex-1 rounded-md bg-gray-800 px-3 py-2 font-semibold text-white">
-                    Bügel runter
+                  <button onClick={() => moveBarrier('unlock')} className="flex-1 rounded-md bg-gray-800 px-3 py-2 font-semibold text-white">
+                    Öffnen (Bügel runter)
                   </button>
                 </div>
+                <label className="mt-2 flex items-center gap-2 text-xs">
+                  <input type="checkbox" checked={cancelAutoLift} onChange={(e) => setCancelAutoLift(e.target.checked)} />
+                  Automatisches Wiederhochfahren abbrechen (cancelAutoLift)
+                </label>
+
+                <p className="mt-3 text-xs font-semibold text-gray-700">Schrankenmodus (Keep-State)</p>
+                <div className="mt-1 flex gap-2">
+                  {(['normal', 'keep_open', 'keep_closed'] as const).map((s) => (
+                    <button key={s} onClick={() => keepState(s)} className="flex-1 rounded-md border border-gray-300 px-2 py-1.5 text-xs font-semibold">
+                      {s}
+                    </button>
+                  ))}
+                </div>
+
+                <p className="mt-3 text-xs font-semibold text-gray-700">
+                  Auto-Unlock per Kennzeichen (Whitelist){!lock?.hasCamera && lock ? ' – dieser Lock hat keine Kamera' : ''}
+                </p>
+                <p className="mt-0.5 text-[11px] text-gray-500">
+                  Wird automatisch nach den Reservierungen gesetzt – manuelle Änderungen überschreibt der nächste Abgleich (alle 15 s).
+                </p>
+                <input
+                  value={platesInput}
+                  onChange={(e) => setPlatesInput(e.target.value)}
+                  placeholder="z. B. MBD14E, B12345"
+                  className="mt-1 w-full rounded-md border border-gray-300 px-2 py-1.5 font-mono text-xs"
+                />
+                <div className="mt-1 flex gap-2">
+                  <button onClick={() => setWhitelist('plates')} className="flex-1 rounded-md border border-gray-300 px-2 py-1.5 text-xs font-semibold">
+                    Setzen
+                  </button>
+                  <button onClick={() => setWhitelist('wildcard')} className="flex-1 rounded-md border border-gray-300 px-2 py-1.5 text-xs font-semibold">
+                    Alle Fahrzeuge
+                  </button>
+                  <button onClick={() => setWhitelist('off')} className="flex-1 rounded-md border border-gray-300 px-2 py-1.5 text-xs font-semibold">
+                    Aus
+                  </button>
+                </div>
+                {adminMsg && <p className={`mt-2 text-xs ${adminMsg.startsWith('Fehler') ? 'text-red-700' : 'text-green-700'}`}>{adminMsg}</p>}
               </div>
             )}
           </div>
 
           <div className="text-xs text-gray-600">
             <p>{stationsMsg ?? 'Ladesäulen werden geladen …'}</p>
+            {resError && <p className="mt-1 text-red-700">{resError}</p>}
             <p className="mt-1">
               Daten:{' '}
               <a className="underline" href="https://www.goingelectric.de/stromtankstellen/" target="_blank" rel="noreferrer">
@@ -393,7 +558,9 @@ export default function FlashApp() {
             </p>
           </div>
         </aside>
+        )}
       </main>
+      </div>
     </div>
   )
 }

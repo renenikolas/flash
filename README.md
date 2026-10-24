@@ -5,21 +5,16 @@ Ecurious-Parkbügel freigehalten wird. **Stufe 1:** Alle externen APIs sind ange
 nachweisbar erreichbar. Die UI ist bewusst noch schlicht.
 
 Stack: Next.js 16 (App Router, Route Handlers als Backend) · TypeScript · Tailwind 4 · Leaflet/react-leaflet mit
-OSM-Kacheln · Supabase (Postgres, RLS, RPC, Anonymous Auth, Realtime Broadcast) · vitest.
+OSM-Kacheln · vitest. Reservierungen liegen serverseitig in `.data/reservations.json` (keine externe Datenbank).
 
-## Setup (5 Befehle)
+## Setup (4 Befehle)
 
 ```bash
 npm install
 cp .env.example .env.local                      # Keys eintragen, siehe Tabelle unten
-npx supabase db push --db-url "<Postgres-Connection-String>"   # Migrationen inkl. Seed
 npm run check:apis                              # ✅/❌ pro API
 npm run dev                                     # http://localhost:3000
 ```
-
-Für den Supabase-Schritt den Connection-String aus dem Dashboard nehmen (*Connect → Session pooler*).
-Alternativ beide Dateien aus `supabase/migrations/` der Reihe nach im SQL-Editor ausführen.
-Im Dashboard außerdem **Authentication → Sign In / Providers → „Allow anonymous sign-ins“** einschalten.
 
 Node ≥ 20.19 (empfohlen 22). Ohne Hardware: `ECURIOUS_MOCK=true` setzen.
 
@@ -27,15 +22,14 @@ Node ≥ 20.19 (empfohlen 22). Ohne Hardware: `ECURIOUS_MOCK=true` setzen.
 
 | Variable | Wo | Öffentlich? | Zweck |
 | --- | --- | --- | --- |
-| `NEXT_PUBLIC_SUPABASE_URL` | `.env.local` / Vercel | ja (Browser) | Supabase-Projekt-URL |
-| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | `.env.local` / Vercel | ja (Browser) | Publishable Key (`sb_publishable_…`), Zugriff nur über RLS/RPCs |
 | `GOINGELECTRIC_API_KEY` | `.env.local` / Vercel | **nein** | nur in `/api/chargepoints` und den Checks |
 | `ECURIOUS_BASE_URL` | `.env.local` / Vercel | **nein** | Base-URL der Parking-Lock-API (von Ecurious) |
 | `ECURIOUS_API_KEY` | `.env.local` / Vercel | **nein** | Header `X-API-Key`, nie als Query-Parameter |
 | `ECURIOUS_LOCK_ID` | `.env.local` / Vercel | nein | optional: Lock des Demo-Stellplatzes (sonst erster Lock aus `GET /api/v1/locks`) |
 | `ECURIOUS_MOCK` | `.env.local` / Vercel | nein | `true` = feste Beispieldaten (ein Lock, vacant, raised) |
 | `ECURIOUS_COMMANDS_ENABLED` | `.env.local` / Vercel | nein | `false` (Standard) = keine Hardware-Befehle möglich |
-| `FLASH_ADMIN_TOKEN` | `.env.local` / Vercel | **nein** | Pflicht für Befehle; die Admin-Buttons fragen danach |
+| `FLASH_API_KEY` | `.env.local` / Vercel | **nein** | Schlüssel für die Reservierungs-API von anderen Servern/Websites (siehe unten) |
+| `FLASH_ADMIN_TOKEN` | `.env.local` / Vercel | **nein** | lokal optional (`npm run dev` hört nur auf 127.0.0.1); in Produktion Pflicht für Befehle, die Admin-Buttons fragen danach |
 
 Server-Keys tragen nie das Präfix `NEXT_PUBLIC_`. `.env.local` ist per `.gitignore` ausgeschlossen, nur
 `.env.example` (ohne Werte) wird committet. Auf Vercel dieselben Variablen unter *Settings → Environment Variables*
@@ -54,10 +48,11 @@ flowchart LR
     L["/api/locks, /api/locks/[id]"]
     E["/api/locks/events (SSE)"]
     CMD["/api/locks/[id]/command (Flag + Admin-Token)"]
+    R["/api/reservations (App + API-Key)"]
   end
   GE[("GoingElectric API")]
   EC[("Ecurious Parking-Lock-API")]
-  SB[("Supabase: Auth, Postgres-RPCs, Realtime")]
+  DATA[(".data/reservations.json")]
   OSM[("OSM-Kacheln")]
 
   UI -->|fetch| H
@@ -65,15 +60,15 @@ flowchart LR
   UI -->|fetch, Polling-Fallback 5 s| L
   UI -->|EventSource| E
   UI -->|POST| CMD
-  UI -->|anonymer Login, rpc list_bays / reserve_bay / cancel_reservation| SB
-  SB -->|Broadcast auf privatem Kanal bays| UI
+  UI -->|fetch, Polling 5 s| R
+  R --> DATA
+  R -->|Whitelist je Reservierung| EC
   UI --> OSM
   C -->|key serverseitig| GE
   L -->|X-API-Key| EC
   E -->|X-API-Key, Kennzeichen maskiert| EC
   CMD -->|X-API-Key| EC
   H --> GE
-  H --> SB
   H --> EC
 ```
 
@@ -84,37 +79,88 @@ flowchart LR
 | `GET /api/locks` | Locks + `defaultLockId` (aus `ECURIOUS_LOCK_ID` bzw. erster Lock) |
 | `GET /api/locks/[id]` | Lock + letztes Kennzeichen (maskiert) |
 | `GET /api/locks/events` | Ecurious-SSE an den Browser, jedes Kennzeichen maskiert, Heartbeat alle 15 s |
-| `POST /api/locks/[id]/command` | `{action: lock\|unlock\|keep-state\|whitelist}`, nur mit `ECURIOUS_COMMANDS_ENABLED=true` + Header `x-admin-token`; `lock` nur bei frischem `carPresence=vacant` |
+| `POST /api/locks/[id]/command` | `{action: lock\|unlock\|keep-state\|whitelist}`, nur mit `ECURIOUS_COMMANDS_ENABLED=true` + Header `x-admin-token` (lokal ohne gesetzten Token nicht nötig); `lock` nur bei frischem `carPresence=vacant` |
 
 **Datenschutz:** Kennzeichen werden serverseitig maskiert (`M-AB 1234` → `M-AB***`), bevor sie REST-Antworten, SSE oder
 Logs erreichen. Statusangaben mit `lastSeenAt` älter als 60 s erscheinen als „unbekannt“.
 
-**Supabase:** `bays` und `reservations` haben RLS ohne Policies, Clients dürfen nur `list_bays()`, `reserve_bay(bay_id,
-minutes, request_id)` und `cancel_reservation(id)` ausführen (nur Rolle `authenticated`, also auch anonyme Gäste).
-`reserve_bay` sperrt die Stellplatz-Zeile (`for update`), setzt abgelaufene Holds auf `expired`, ist über `request_id`
-idempotent und rechnet die Ablaufzeit mit `now()` der DB. Ein partieller Unique-Index erzwingt höchstens einen `held`
-pro Stellplatz. Ein Trigger sendet jede Änderung per `realtime.send` (Broadcast from Database) auf den privaten Kanal
-`bays`, ohne `user_id` im Payload; andere Tabs laden daraufhin `list_bays()` neu. Der Countdown rechnet mit der DB-Uhr
-(`server_now`), nicht mit der Browser-Uhr.
+## Reservierungs-API (für andere Server und Websites)
+
+Andere Server oder Websites können Ladesäulen reservieren. Die Buchungen erscheinen sofort in der Web-App
+(Feld auf der Karte, Profil), weil App und API dieselben Daten nutzen (`.data/reservations.json`).
+
+- Basis-URL lokal: `http://localhost:3000/api/reservations`
+- Authentifizierung: Header `Authorization: Bearer <FLASH_API_KEY>` (Wert aus `.env.local`). Die eigene Web-App braucht keinen Schlüssel.
+- CORS ist offen, also auch direkt aus dem Browser einer anderen Seite aufrufbar. Den Schlüssel aber nur von einem Server aus schicken, nie in öffentliches Frontend-JavaScript schreiben.
+- `npm run dev` hört nur auf `127.0.0.1`: erreichbar von Servern auf demselben Rechner.
+
+| Methode | Pfad | Zweck |
+| --- | --- | --- |
+| `POST` | `/api/reservations` | Reservierung anlegen (ersetzt eine bestehende derselben Station) |
+| `GET` | `/api/reservations` | alle laufenden und kommenden Reservierungen |
+| `GET` | `/api/reservations/{stationId}` | eine Reservierung |
+| `DELETE` | `/api/reservations/{stationId}` | stornieren |
+
+Body für `POST`:
+
+| Feld | Pflicht | Beschreibung |
+| --- | --- | --- |
+| `stationId` | ja | Ganzzahl. GoingElectric-ID der Ladesäule (`id` aus `/api/chargepoints`) oder `-1` für den TUM-Flottenstandort |
+| `stationName` | ja (außer `-1`) | Anzeigename |
+| `kind` | ja | `"quick"` (15 min ab jetzt, kostenlos) oder `"scheduled"` (Termin) |
+| `startsAt` | bei `scheduled` | ISO-Zeit, z. B. `"2026-10-25T14:00:00+02:00"`; höchstens 30 Tage im Voraus |
+| `plan` | nein | `"free"` (Standard) oder `"paid"` (50 % Rabatt) |
+| `car` | bei `-1` | `{ "name": "VW ID.3", "plate": "M-AB 12" }`. Für den TUM-Standort muss `plate` ein TUM-Flottenkennzeichen sein (`T-UM-2026`) |
+| `stationAddress`, `lat`, `lng` | nein | für Anzeige und „Zur Station“ in der App |
+| `chargePoints` | nein | Anzahl der Ladepunkte der Station (1–50) = Anzahl der Bays in der Parkplatz-Grafik; ohne Angabe die Anzahl der Bügel |
+
+Antworten: `201 { reservation }` mit Zeitraum, Gebühr (`feeEur`, `feeBaseEur`) und zugeteiltem Bay (`bay.name`, `bay.lockId`).
+Fehler: `400` ungültige Eingabe, `401` Schlüssel fehlt/falsch, `403` Flottenstandort ohne passendes Auto, `409` kein Bay frei,
+jeweils `{ error }`.
+
+```bash
+curl -X POST http://localhost:3000/api/reservations \
+  -H "Authorization: Bearer $FLASH_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"stationId": 368, "stationName": "Planckstraße", "kind": "quick", "car": {"name": "VW ID.3", "plate": "M-AB 12"}}'
+```
+
+Von einem anderen Node-Server (z. B. Express, Next.js-Route):
+
+```js
+const res = await fetch('http://localhost:3000/api/reservations', {
+  method: 'POST',
+  headers: { Authorization: `Bearer ${process.env.FLASH_API_KEY}`, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ stationId: 368, stationName: 'Planckstraße', kind: 'scheduled', startsAt: '2026-10-25T14:00:00+02:00' }),
+})
+const body = await res.json()
+if (!res.ok) throw new Error(body.error)
+console.log(body.reservation.bay.name) // "Bay 1"
+```
+
+### Whitelist folgt den Reservierungen
+
+Der Server gleicht alle 15 s (und direkt nach jeder Buchung/Stornierung) die Ecurious-Whitelists ab
+(`lib/whitelist-sync.ts`, gestartet in `instrumentation.ts`):
+
+- Im Reservierungsfenster steht auf dem zugeteilten Bügel **nur das Kennzeichen der Reservierung** (ohne Trennzeichen, `M-AB 12` → `MAB12`).
+  Kurzreservierung: die 15 Minuten. Termin: 5 Minuten vor Beginn bis 5 Minuten nach Ende.
+- Danach (oder nach Storno) wieder **jedes Kennzeichen** (`wildcard`).
+- Nur mit `ECURIOUS_COMMANDS_ENABLED=true`. Gesendet wird nur, wenn Soll und Ist abweichen; denselben Befehl höchstens alle 2 Minuten.
+- Manuelle Whitelist-Änderungen im Admin-Bereich überschreibt der nächste Abgleich.
 
 ## Checks und Tests
 
 ```bash
-npm run check:apis   # GoingElectric, Supabase (anonym + list_bays), Ecurious /locks, plate/latest, 5 s SSE
-npm test             # vitest: GE-Normalisierung, Kennzeichen-Maskierung, SSE-Maskierung, Datenalter, Supabase-Race
+npm run check:apis   # GoingElectric, Ecurious /locks, plate/latest, 5 s SSE
+npm test             # vitest: GE-Normalisierung, Masken, Reservierungen, Gebühren, Whitelist-Fenster, Profil/Flotte
 ```
 
 - `check:apis` ist nur lesend, alle Checks laufen parallel mit je 5 s Timeout (gesamt ≈ 5 s). Es prüft immer die
   echte Ecurious-API, auch wenn `ECURIOUS_MOCK=true` für die Webseite gesetzt ist.
-- `tests/reserve-race.test.ts` läuft gegen die echte Supabase-DB: zwei anonyme Gäste reservieren gleichzeitig, genau
-  einer gewinnt; danach Idempotenz, Fremd-Storno und Aufräumen. Ohne Supabase-Keys wird er übersprungen, ebenso wenn
-  der Stellplatz gerade reserviert ist.
 
 ## Doku-Abgleich (Stand 24.10.2026)
 
-- **Supabase:** gegen die offizielle Doku (Repo `supabase/supabase`, `apps/docs`) geprüft: Broadcast from Database
-  (`realtime.send`, private Kanäle, RLS-Policy auf `realtime.messages`), Anonymous Sign-ins (Rolle `authenticated`,
-  Claim `is_anonymous`, IP-Limit 30/h, CAPTCHA empfohlen).
 - **Next.js 16.4:** gegen die mitgelieferte Doku in `node_modules/next/dist/docs` (Route Handlers mit Cache Components,
   `connection()`).
 - **GoingElectric:** Die offizielle Seite (goingelectric.de/stromtankstellen/api) war aus der Build-Umgebung nicht
@@ -129,23 +175,11 @@ npm test             # vitest: GE-Normalisierung, Kennzeichen-Maskierung, SSE-Ma
 
 ## Bekannte Grenzen
 
-- **Live nicht verifiziert:** In der Build-Umgebung waren GoingElectric, Ecurious und Supabase per Netzwerk-Policy
-  gesperrt, und es gab keine Keys. Alles wurde gegen lokale Nachbauten getestet: Fake-Ecurious im dokumentierten
-  Format, Postgres 16 mit nachgebautem `auth`/`realtime`-Schema inklusive echtem Parallel-Test, abgefangene
-  Supabase-Antworten im Browser. Erster Schritt mit echten Keys: `npm run check:apis` und `npm test`.
-- **Lock-Zuordnung:** Der Seed legt den Stellplatz ohne `lock_id` an, weil SQL-Migrationen keine Umgebungsvariablen
-  lesen. Der Server ordnet dann `ECURIOUS_LOCK_ID` (oder den ersten Lock) zu. Fest verknüpfen per SQL:
-  `update public.bays set lock_id = '<id>'` (die ID zeigt `check:apis`).
-- **Reservierung und Bügel sind noch nicht gekoppelt:** Reservieren bewegt keine Hardware (siehe Roadmap).
+- **Keine Datenbank, keine Konten:** Reservierungen liegen in `.data/reservations.json` auf dem Server, Autos und Plan
+  nur im Browser. Alle Reservierungen gelten als „meine“. Für mehrere Nutzer braucht es Konten und eine Datenbank.
+- **Nur zwei Bays:** Bays sind die Ecurious-Locks des Teams; es gibt so viele gleichzeitige Reservierungen wie Locks.
 - **SSE auf Vercel:** Funktionen haben eine Maximallaufzeit. Danach endet der Stream und `EventSource` verbindet neu;
   dazwischen pollt die Seite alle 5 s. Mock-SSE-Events gibt es nur innerhalb eines Server-Prozesses (lokal).
-- **Abgelaufene Holds** werden erst beim nächsten `reserve_bay` auf `expired` gesetzt. `list_bays()` zeigt sie aber
-  sofort als frei an, und der Browser lädt beim Countdown-Ende neu.
-- **Realtime-Partition:** Laut Supabase-Doku legt erst ein verbundener Client die Tagespartition von
-  `realtime.messages` an. Vorher scheitert der Broadcast mit einer Warnung; die Reservierung selbst klappt trotzdem.
-- **Anonyme User sammeln sich:** pro Browser einer, pro Testlauf zwei, pro Server-Instanz einer für `/api/health`.
-  Aufräumen z. B. per `delete from auth.users where is_anonymous and created_at < now() - interval '30 days';`.
-  Vor einem öffentlichen Einsatz CAPTCHA/Turnstile aktivieren (Supabase-Empfehlung).
 - **Admin-Schutz** ist nur ein gemeinsames Token. Befehle sind standardmäßig aus.
 - **OSM-Kacheln** direkt von tile.openstreetmap.org sind nur für den Prototyp gedacht (Tile Usage Policy); für
   echten Betrieb einen eigenen Kachel-Anbieter nehmen.
@@ -159,5 +193,5 @@ npm test             # vitest: GE-Normalisierung, Kennzeichen-Maskierung, SSE-Ma
 2. **No-Show-Ablauf:** Hold läuft ab → Whitelist entfernen, Platz wieder freigeben, ggf. Sperrfrist für den Gast.
 3. **Blockierter Stellplatz:** `vehicle_presence=occupied` ohne passendes Kennzeichen erkennen, Reservierung pausieren
    bzw. umbuchen, Betreiber benachrichtigen (`alarm`-Events).
-4. Gäste-Accounts in feste Accounts überführen, CAPTCHA, Admin-Rollen statt Token.
-5. Später ggf. mobile App (gleiche Supabase-RPCs und Route Handlers).
+4. Konten und eine Datenbank statt Browser- und Dateispeicher, Admin-Rollen statt Token.
+5. Später ggf. mobile App (gleiche Route Handlers).

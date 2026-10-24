@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -H 127.0.0.1",
     "build": "next build",
     "start": "next start",
     "typecheck": "next typegen && tsc --noEmit",
@@ -11,7 +11,6 @@
     "check:apis": "node scripts/check-apis.mjs"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.118.0",
     "leaflet": "^1.9.4",
     "next": "16.4.3",
     "react": "19.3.0",

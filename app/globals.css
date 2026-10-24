@@ -3,18 +3,3 @@
 body {
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
-
-/* Eigener Stellplatz auf der Karte */
-.flash-bay {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  border-radius: 9999px;
-  border: 3px solid #fff;
-  box-shadow: 0 0 0 3px #111827, 0 2px 6px rgb(0 0 0 / 0.4);
-  color: #fff;
-  font: 700 16px/1 ui-sans-serif, system-ui, sans-serif;
-}
-.flash-bay.free { background: #16a34a; }
-.flash-bay.held { background: #d97706; }

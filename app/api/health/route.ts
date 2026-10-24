@@ -9,7 +9,7 @@ export type Health = {
   checkedAt: string
 }
 
-// 30 s im Speicher: schont Rate-Limits (u. a. anonyme Supabase-Logins) bei vielen offenen Tabs.
+// 30 s im Speicher: schont Rate-Limits bei vielen offenen Tabs.
 let cached: { at: number; promise: Promise<Health> } | null = null
 
 async function compute(): Promise<Health> {

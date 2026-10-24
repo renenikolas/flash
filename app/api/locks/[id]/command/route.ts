@@ -1,4 +1,5 @@
-// Hardware-Befehle. Nur aktiv mit ECURIOUS_COMMANDS_ENABLED=true und passendem Admin-Token.
+// Hardware-Befehle. Nur aktiv mit ECURIOUS_COMMANDS_ENABLED=true.
+// Ohne FLASH_ADMIN_TOKEN nur lokal (next dev, an 127.0.0.1 gebunden); in Produktion ist der Token Pflicht.
 import { timingSafeEqual } from 'node:crypto'
 import type { NextRequest } from 'next/server'
 import { type Command, EcuriousError, ecuriousConfig, getLock, sendCommand } from '@/lib/ecurious'
@@ -34,7 +35,10 @@ export async function POST(req: NextRequest, ctx: RouteContext<'/api/locks/[id]/
   if (!cfg.commandsEnabled) {
     return Response.json({ error: 'Befehle sind deaktiviert (ECURIOUS_COMMANDS_ENABLED=false)' }, { status: 403 })
   }
-  if (!tokenMatches(req.headers.get('x-admin-token'), cfg.adminToken)) {
+  if (!cfg.adminToken && process.env.NODE_ENV === 'production') {
+    return Response.json({ error: 'In Produktion ist FLASH_ADMIN_TOKEN Pflicht' }, { status: 403 })
+  }
+  if (cfg.adminToken && !tokenMatches(req.headers.get('x-admin-token'), cfg.adminToken)) {
     return Response.json({ error: 'Admin-Token fehlt oder ist falsch (FLASH_ADMIN_TOKEN)' }, { status: 401 })
   }
   const { id } = await ctx.params

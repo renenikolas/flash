@@ -17,13 +17,14 @@ export type RawLock = {
   waterIngress?: boolean
   activeErrors?: unknown[]
   lastSeenAt?: string | null
+  whitelist?: string[] // "*" = jedes Kennzeichen
 }
 
 export type LockView = {
   id: string
   name: string
   hasCamera: boolean
-  status: 'raised' | 'lowered' | 'unknown'
+  status: 'raised' | 'lowered' | 'moving' | 'unknown'
   carPresence: 'vacant' | 'occupied' | 'unknown'
   lastSeenAt: string | null
   ageSec: number | null
@@ -70,7 +71,7 @@ export function toLockView(raw: RawLock, nowMs = Date.now()): LockView {
   const seen = raw.lastSeenAt ? Date.parse(raw.lastSeenAt) : NaN
   const ageSec = Number.isNaN(seen) ? null : Math.max(0, Math.round((nowMs - seen) / 1000))
   const stale = ageSec === null || ageSec > STALE_AFTER_SEC
-  const status = raw.status === 'raised' || raw.status === 'lowered' ? raw.status : 'unknown'
+  const status = raw.status === 'raised' || raw.status === 'lowered' || raw.status === 'moving' ? raw.status : 'unknown'
   const presence = raw.carPresence === 'vacant' || raw.carPresence === 'occupied' ? raw.carPresence : 'unknown'
   return {
     id: raw.id,
@@ -133,6 +134,7 @@ const mockLock: RawLock = {
   signalStrength4G: 22,
   waterIngress: false,
   activeErrors: [],
+  whitelist: ['*'],
 }
 const mockPlate = { lockId: mockLock.id, licensePlate: 'B-FL 4711', plateType: 'standard' }
 
@@ -169,6 +171,12 @@ export async function getLock(id: string) {
   return { lock: toLockView(lock), plate: toPlateView(plate), mock: false }
 }
 
+/** Aktuelle Whitelist je Lock (nur serverseitig; enthält Kennzeichen im Klartext). */
+export async function getWhitelists(): Promise<{ id: string; whitelist: string[] | null }[]> {
+  const raw = ecuriousConfig().mock ? [mockLock] : ((await call<{ locks?: RawLock[] }>('/api/v1/locks')).locks ?? [])
+  return raw.map((l) => ({ id: l.id, whitelist: Array.isArray(l.whitelist) ? l.whitelist : null }))
+}
+
 /** Bewegt echte Hardware. Nur aus der Command-Route aufrufen (Flag + Admin-Token geprüft). */
 export async function sendCommand(id: string, cmd: Command) {
   assertLockId(id)
@@ -179,6 +187,7 @@ export async function sendCommand(id: string, cmd: Command) {
       const detail = { type: 'status_change', lockId: id, status: mockLock.status, timestamp: new Date().toISOString() }
       mockEvents.dispatchEvent(new CustomEvent('status_change', { detail }))
     }
+    if (cmd.action === 'whitelist') mockLock.whitelist = cmd.wildcard ? ['*'] : (cmd.plates ?? [])
     return { success: true, message: `Mock: ${action} ausgeführt`, result: { deviceStatus: mockLock.status, carPresence: mockLock.carPresence, success: true } }
   }
   return call<{ success: boolean; message?: string; result?: unknown }>(
