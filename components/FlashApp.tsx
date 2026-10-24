@@ -7,6 +7,7 @@ import type { BBox, Station } from '@/lib/goingelectric'
 import { TUM_STAMMGELAENDE } from '@/lib/fleet-sites'
 import { activeCar, DEMO_PROFILE, type Garage, loadGarage, loadPlan, loadTrust, type Plan } from '@/lib/profile'
 import { activeReservations, type StationReservation } from '@/lib/station-reservations'
+import ApiKeysMenu from './ApiKeysMenu'
 import BayNotice, { loadSeenBayNotices, noticeKey, pendingBayNotice } from './BayNotice'
 import ProfileView from './ProfileView'
 
@@ -57,6 +58,7 @@ export default function FlashApp() {
   const [now, setNow] = useState(0) // erst im Browser setzen, nicht beim Prerender
   const [tab, setTab] = useState<'map' | 'profile'>('map')
   const [health, setHealth] = useState<Health | null>(null)
+  const reloadHealth = useRef<() => void>(() => {})
 
   // Ecurious
   const [defaultLockId, setDefaultLockId] = useState<string | null>(null)
@@ -94,6 +96,7 @@ export default function FlashApp() {
   // ---------- API-Status ----------
   useEffect(() => {
     const load = () => fetch('/api/health').then((r) => r.json()).then(setHealth).catch(() => {})
+    reloadHealth.current = () => fetch('/api/health?fresh=1').then((r) => r.json()).then(setHealth).catch(() => {})
     load()
     const t = setInterval(load, 60_000)
     return () => clearInterval(t)
@@ -390,7 +393,10 @@ export default function FlashApp() {
             ))}
           </nav>
         </div>
-        <StatusBar health={health} />
+        <div className="flex items-start gap-2">
+          <StatusBar health={health} />
+          <ApiKeysMenu onSaved={() => reloadHealth.current()} />
+        </div>
       </header>
 
       {/* Karte bleibt gemountet (Leaflet, SSE); das Profil liegt darüber. */}

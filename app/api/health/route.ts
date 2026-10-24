@@ -19,9 +19,11 @@ async function compute(): Promise<Health> {
   return { checks, ecuriousMock: cfg.mock, commandsEnabled: cfg.commandsEnabled, checkedAt: new Date().toISOString() }
 }
 
-export async function GET() {
+export async function GET(req: Request) {
   await connection()
-  if (!cached || Date.now() - cached.at > 30_000) {
+  // ?fresh=1: sofort neu prüfen, z. B. nach dem Ändern der API-Schlüssel im Menü
+  const fresh = new URL(req.url).searchParams.has('fresh')
+  if (fresh || !cached || Date.now() - cached.at > 30_000) {
     cached = { at: Date.now(), promise: compute() }
   }
   return Response.json(await cached.promise, { headers: { 'Cache-Control': 'no-store' } })
